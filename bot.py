@@ -1,130 +1,143 @@
-import os
-import logging
+import os, logging, aiohttp
 from datetime import datetime, timezone
-import asyncio
-import aiohttp
-import pandas as pd
-from bs4 import BeautifulSoup
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-MIN_SIGNAL = int(os.getenv("MIN_SIGNAL", "65"))
-
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("btc-bot")
 
-async def fetch_text(url):
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"}) as r:
+async def get_json(url, params=None):
+    async with aiohttp.ClientSession(headers={"User-Agent":"BTC-Signal-Bot/2.0"}) as s:
+        async with s.get(url, params=params, timeout=20) as r:
             r.raise_for_status()
-            return await r.text()
+            return await r.json()
 
-async def get_etf_flows():
-    # Farside publishes daily US spot BTC ETF flows in USD millions.
-    html = await fetch_text("https://farside.co.uk/btc/")
-    tables = pd.read_html(html)
-    for t in tables:
-        cols = [str(c).strip() for c in t.columns]
-        if "Total" in cols:
-            total = pd.to_numeric(
-                t["Total"].astype(str).str.replace(",", "", regex=False)
-                .str.replace("(", "-", regex=False).str.replace(")", "", regex=False)
-                .replace("-", "0"), errors="coerce"
-            ).dropna()
-            if len(total):
-                return float(total.iloc[-1]), total.tail(20).tolist()
-    raise RuntimeError("ETF table not found")
+async def btc_market():
+    j = await get_json("https://api.binance.com/api/v3/ticker/24hr", {"symbol":"BTCUSDT"})
+    return float(j["lastPrice"]), float(j["priceChangePercent"]), float(j["quoteVolume"])
 
-async def get_btc():
-    url = "https://api.binance.com/api/v3/ticker/24hr?symbol=BTCUSDT"
-    async with aiohttp.ClientSession() as s:
-        async with s.get(url, timeout=10) as r:
-            r.raise_for_status()
-            j = await r.json()
-            return {
-                "price": float(j["lastPrice"]),
-                "change": float(j["priceChangePercent"]),
-                "volume": float(j["quoteVolume"]),
-            }
+async def derivatives():
+    funding = await get_json("https://fapi.binance.com/fapi/v1/fundingRate",
+                             {"symbol":"BTCUSDT","limit":5})
+    oi = await get_json("https://fapi.binance.com/fapi/v1/openInterest",
+                        {"symbol":"BTCUSDT"})
+    avg_funding = sum(float(x["fundingRate"]) for x in funding) / len(funding)
+    return avg_funding, float(oi["openInterest"])
 
-def score(etf_last, etf_hist, btc):
-    # ETF component: current flow + short-term persistence.
-    etf = max(-40, min(40, etf_last / 15))
-    persistence = 0
-    if len(etf_hist) >= 5:
-        avg5 = sum(etf_hist[-5:]) / 5
-        persistence = max(-15, min(15, avg5 / 20))
+async def etf_flow():
+    # Public Kote Charts endpoint. The bot degrades gracefully if unavailable.
+    j = await get_json("https://kotecharts.com/api/v1/public/charts/etf-flows")
+    data = j.get("data", j)
+    if isinstance(data, dict):
+        data = data.get("data", [])
+    rows = []
+    for x in data[-30:]:
+        if isinstance(x, dict):
+            val = x.get("net_flow", x.get("flow", x.get("value")))
+        elif isinstance(x, (list, tuple)) and len(x) >= 2:
+            val = x[-1]
+        else:
+            continue
+        try:
+            rows.append(float(val))
+        except Exception:
+            pass
+    if not rows:
+        raise RuntimeError("ETF data unavailable")
+    return rows[-1], rows[-5:]
 
-    # Price/volume confirmation, intentionally simple for MVP.
-    momentum = max(-20, min(20, btc["change"] * 3))
-    volume_bonus = 5 if btc["volume"] > 1_000_000_000 else 0
+def liquidity_proxy(price_change, volume):
+    vol_score = 5 if volume >= 1_000_000_000 else 0
+    return max(-10, min(10, price_change * 1.5)) + vol_score
 
-    raw = etf + persistence + momentum + volume_bonus
-    return int(max(-100, min(100, raw)))
+async def report():
+    price, change, volume = await btc_market()
+    funding, oi = await derivatives()
 
-def signal(score_value):
-    if score_value >= 65:
-        return "🟢 BUY"
-    if score_value <= -65:
-        return "🔴 SELL"
-    return "🟡 WAIT"
+    etf = None
+    etf5 = []
+    try:
+        etf, etf5 = await etf_flow()
+    except Exception as e:
+        log.warning("ETF source unavailable: %s", e)
 
-async def build_report():
-    etf_last, hist = await get_etf_flows()
-    btc = await get_btc()
-    s = score(etf_last, hist, btc)
-    sig = signal(s)
+    score = 0
+    reasons = []
+
+    if etf is not None:
+        score += max(-35, min(35, etf / 20))
+        reasons.append(f"ETF {etf:+.1f}")
+        if etf5:
+            score += max(-15, min(15, (sum(etf5)/len(etf5))/30))
+    else:
+        reasons.append("ETF unavailable")
+
+    score += max(-20, min(20, change * 3))
+    reasons.append("momentum +" if change > 0 else "momentum -" if change < 0 else "momentum neutral")
+
+    liq = liquidity_proxy(change, volume)
+    score += liq
+
+    if funding > 0.0002:
+        score -= 8
+        reasons.append("funding high")
+    elif funding < -0.0002:
+        score += 8
+        reasons.append("funding low")
+
+    score = max(-100, min(100, int(round(score))))
+    signal = "🟢 BUY" if score >= 65 else "🔴 SELL" if score <= -65 else "🟡 WAIT"
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    etf_txt = f"${etf:+,.1f}M" if etf is not None else "N/A"
+
     return (
-        f"{sig}\n\n"
-        f"BTC: ${btc['price']:,.0f}\n"
-        f"24h: {btc['change']:+.2f}%\n"
-        f"ETF flow: ${etf_last:+,.1f}M\n"
-        f"ETF 5d avg: ${sum(hist[-5:])/min(5,len(hist)):+,.1f}M\n"
-        f"Signal score: {s:+d}/100\n"
+        f"{signal}\n\n"
+        f"BTC: ${price:,.0f}\n"
+        f"24h: {change:+.2f}%\n"
+        f"ETF flow: {etf_txt}\n"
+        f"Funding: {funding*100:+.4f}%\n"
+        f"Open Interest: {oi:,.0f} BTC\n"
+        f"Liquidity proxy: {liq:+.1f}\n"
+        f"Signal: {score:+d}/100\n"
+        f"Reasons: {', '.join(reasons)}\n"
         f"Updated: {now}\n\n"
-        f"⚠️ Signal only — no automatic trading."
+        "⚠️ Market signal only; no automatic trading."
     )
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "BTC Signal Bot\n\n"
+        "BTC ETF + Liquidity Signal Bot\n\n"
         "/signal — текущий сигнал\n"
-        "/status — краткий статус\n\n"
-        "Модель использует ETF flows + BTC momentum/volume."
+        "/status — текущий сигнал\n"
+        "/notify — автоуведомления каждый час"
     )
 
-async def signal_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await update.message.reply_text(await build_report())
+        await update.message.reply_text(await report())
     except Exception as e:
-        log.exception("signal error")
+        log.exception("signal failed")
         await update.message.reply_text(f"Ошибка получения данных: {e}")
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(await build_report())
-
-async def scheduled(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.data
-    try:
-        report = await build_report()
-        # Notify only on strong signals.
-        if "BUY" in report or "SELL" in report:
-            await context.bot.send_message(chat_id=chat_id, text=report)
-    except Exception:
-        log.exception("scheduled error")
-
 async def notify(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    context.job_queue.run_repeating(scheduled, interval=3600, first=5, data=chat_id)
-    await update.message.reply_text("Автоуведомления включены: проверка раз в час.")
+    context.job_queue.run_repeating(job, interval=3600, first=5,
+                                    data=update.effective_chat.id)
+    await update.message.reply_text("Автоуведомления включены. Проверка каждый час.")
+
+async def job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        r = await report()
+        if r.startswith("🟢") or r.startswith("🔴"):
+            await context.bot.send_message(chat_id=context.job.data, text=r)
+    except Exception:
+        log.exception("scheduled job failed")
 
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("signal", signal_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("signal", signal))
+    app.add_handler(CommandHandler("status", signal))
     app.add_handler(CommandHandler("notify", notify))
     app.run_polling()
 
