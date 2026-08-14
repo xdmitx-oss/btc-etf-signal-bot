@@ -1,4 +1,5 @@
-BTC ETF + Liquidity Telegram Bot v2
-Replace bot.py and requirements.txt in the existing GitHub repository.
-No Binance API key is required for the public market/futures endpoints.
-ETF data uses the public Kote Charts endpoint; if unavailable, ETF is reported as N/A.
+# BTC Telegram Signal Bot v6
+
+Coinbase public BTC market + order book and Farside ETF daily flow.
+No Binance API is used. Missing key data prevents BUY/SELL.
+Run exactly one instance with the Telegram token.
