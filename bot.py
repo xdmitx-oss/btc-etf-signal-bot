@@ -144,7 +144,7 @@ def classify_flow(value):
 
 def build_signal(change, volume, imbalance, flows):
     # ETF trend is intentionally more important than a single ETF day.
-    f1 = flows[-1]
+    f1 = flows[-1][1]
     f3 = sum(x[1] for x in flows[-3:])
     f5 = sum(x[1] for x in flows[-5:])
 
